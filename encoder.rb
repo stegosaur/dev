@@ -4,7 +4,7 @@ $LOAD_PATH.unshift("#{File.dirname(__FILE__)}/")
 require 'aws-sdk'
 require 'mysql2'
 require 'logger'
-require 'config-stage.rb'
+require 'config-prod.rb'
 
 @ec2 = Aws::EC2::Client.new(region: 'us-east-1')
 
@@ -16,18 +16,24 @@ def getInstances()
     @oldEncoders = @encoders unless @encoders.nil?
     @encoders = []
     @instances.each{ |instance| 
-        if instance.inspect.match(/running.*?enc.*?-staging/) and !(instance.inspect.match(/enc0-staging/))
-            @encoders << { "#{instance.inspect.match(/enc.*?-staging/)}" => "#{instance[4][0][0]}"} 
+        if instance[:instances][0][:tags].inspect =~ /"Name", value="enc.*jwplatform.com/ and !(instance.inspect.match("enc0.jwplatform.com"))
+            @encoders << { "#{instance.inspect.match(/value="enc.*?jwplatform.com/).to_s.gsub(/.jwplatform.com|value="/, "")}" => "#{instance[4][0][0]}"} 
             @zone[instance[4][0][11][0]] += 1
         end
     }
     @encoders=@encoders.sort_by { |key| key.keys }
-    @logger.debug("new transcoders detected: #{(@encoders - @oldEncoders).to_s}") if @encoders-@oldEncoders != [] 
+    if @encoders-@oldEncoders != [] 
+        @logger.debug("new transcoders detected: #{(@encoders - @oldEncoders).to_s}")
+        monitor()
+    elsif @oldEncoders-@encoders != []
+    @logger.debug("transcoder removal detected: #{(@oldEncoders - @encoders).to_s}") 
+        monitor(true)
+    end
 end
 
 def launchInstance(zone, subnet)
     instance_id = @ec2.run_instances(
-      image_id: @ami, min_count: 1, max_count: 1, key_name: "Ops-Stage", instance_type: "c4.xlarge",
+      image_id: @ami, min_count: 1, max_count: 1, key_name: "Ops-Prod", instance_type: "c4.4xlarge",
       placement: {
         availability_zone: zone,
         tenancy: "default",
@@ -36,9 +42,9 @@ def launchInstance(zone, subnet)
         {
           device_name: "/dev/sda1",
           ebs: {
-            volume_size: 10,
+            volume_size: 250,
             delete_on_termination: true,
-            volume_type: "standard",
+            volume_type: "gp2",
           },
         },
       ],
@@ -46,36 +52,34 @@ def launchInstance(zone, subnet)
       disable_api_termination: false,
       instance_initiated_shutdown_behavior: "terminate",
       network_interfaces: [ { groups: [@default_security_group], subnet_id: subnet, device_index: 0, associate_public_ip_address: true } ],
-      iam_instance_profile: { name: "encoder" },
+      iam_instance_profile: { name: "Encoder" },
       ebs_optimized: true,
     )[:instances][0][0]
     return instance_id
 end
 
-def monitor(encoder, active)
-    sedremove = "s/\\'#{encoder.keys.first}/\\#\\'#{encoder.keys.first}/g"
-    sedadd = "s/\\#\\'#{encoder.keys.first}/\\'#{encoder.keys.first}/g"
-    if active == false
-        @logger.info("running /bin/sed -i #{sedremove} /etc/check_mk/main.mk")
-        `/bin/sed -i #{sedremove} /etc/check_mk/main.mk`
-        @logger.debug`/usr/bin/cmk -O`
-    else
-        @logger.info("running /bin/sed -i #{sedadd} /etc/check_mk/main.mk")
-        `/bin/sed -i #{sedadd} /etc/check_mk/main.mk`
-        @logger.debug(`/usr/bin/cmk -O`)
-    end
+def monitor(remove=false)
+    conf=["all_hosts += [", "", "]"]
+    @encoders.each {|enc| conf.insert(1, "'#{enc.keys[0]}.jwplatform.com',") }
+    f = File.new("/etc/check_mk/conf.d/enc.mk", "w+")
+    conf.each { |line| f.write(line.gsub(/$/, "\n")) }
+    f.chmod(0644)
+    f.close
+    @encoders.each {|enc| @logger.debug("scanning #{enc.keys[0]}")
+                    `/usr/bin/cmk -II #{enc.keys[0]}.jwplatform.com` } unless remove==true
+    @logger.debug(`/usr/bin/cmk -O`)
 end
 
 def sweeper()
     registeredTranscoders = []
-    @db.query("select distinct(transcoder_id) from transcoder").each {|result| registeredTranscoders <<  result.values[0] unless result.values[0] == "enc0-staging"}
+    @db.query("select distinct(transcoder_id) from transcoder").each {|result| registeredTranscoders <<  result.values[0] unless result.values[0] == "enc0"}
     registeredTranscoders.each {|transcoder|
-        running = @ec2.describe_instance_status(:instance_ids => [transcoder.gsub("enc", "i-").gsub("-staging", "")]).data.inspect.match(/running/).to_s rescue Aws::EC2::Errors::InvalidInstanceIDNotFound
+        running = @ec2.describe_instance_status(:instance_ids => [transcoder.gsub("enc", "i-")]).data.inspect.match(/running/).to_s rescue Aws::EC2::Errors::InvalidInstanceIDNotFound
         if running != "running"
             @db.query("delete from transcoder where transcoder_id='#{transcoder}'")
             @logger.error("deleted offline transcoder #{transcoder} from pool")
             @db.query("update queue set processed = null, transcoder_id=null where transcoder_id='#{transcoder}'")
-            @db.query("update uploadqueue set upload_server_id='enc0-staging', processing = NULL where upload_server_id='#{transcoder}'")
+            @db.query("update uploadqueue set upload_server_id='enc0', processing = NULL where upload_server_id='#{transcoder}'")
             @logger.error("moved jobs from offline transcoder #{transcoder}")
         end }
 end 
@@ -122,7 +126,7 @@ def start_encoder(encoder=nil)
         @logger.info("launching new encoder")
         zone = @zone.select {|key, value| value == @zone.values.min }.first[0]
         instance_id=launchInstance(zone, @subnets[zone[-1]])
-        encoder="enc#{instance_id.gsub("i-", "")}-staging"
+        encoder="enc#{instance_id.gsub("i-", "")}"
         count=0
         until @db.query("select count(*) from transcoder where transcoder_id='#{encoder}'").first.values[0] != 0
             count += 1
@@ -170,11 +174,9 @@ def check_queue
     queue = @db.query("select count(*) from queue where type='conversion' and subpriority < 25 and transcoder_id is null and added < now()-60").first.values[0]
     users = @db.query("SELECT COUNT(DISTINCT `scheduler_group_id`) FROM `queue` WHERE `try_count` < max_try_count;").first.values[0]
     #@db.query("update queue set priority=6 where data not like '%320L%' and subpriority > 25") #prioritize 320L to keep queue at minimum and speed up ready state until proper fix is in place
-    sweeper()
+    #sweeper()
     @logger.debug("queue at #{queue}, users at #{users}")
-    if queue > 15 or queuesize > online * 1000
-        scaleUp()
-    elsif queuesize > online*500
+    if queue > 15 or queuesize > online * 500
         scaleUp()
     elsif queuesize > online*200 or queue >= 5
         activateOnly=true
