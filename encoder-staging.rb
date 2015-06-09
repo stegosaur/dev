@@ -66,7 +66,7 @@ def monitor(encoder, active)
     end
 end
 
-def sweeper() #this will prevent jobs from getting stuck on an offline transcoder
+def sweeper()
     registeredTranscoders = []
     @db.query("select distinct(transcoder_id) from transcoder").each {|result| registeredTranscoders <<  result.values[0] unless result.values[0] == "enc0-staging"}
     registeredTranscoders.each {|transcoder|
@@ -74,10 +74,8 @@ def sweeper() #this will prevent jobs from getting stuck on an offline transcode
         if running != "running"
             @db.query("delete from transcoder where transcoder_id='#{transcoder}'")
             @logger.error("deleted offline transcoder #{transcoder} from pool")
-            @db.query("update queue set processed = null where transcoder_id='#{transcoder}'")
-            @db.query("update queue set transcoder_id='enc0-staging' where transcoder_id='#{transcoder}'")
-            @db.query("update uploadqueue set upload_server_id='enc0-staging' where upload_server_id='#{transcoder}'")
-            @db.query("update uploadqueue set processing = NULL where upload_server_id='#{transcoder}'")
+            @db.query("update queue set processed = null, transcoder_id=null where transcoder_id='#{transcoder}'")
+            @db.query("update uploadqueue set upload_server_id='enc0-staging', processing = NULL where upload_server_id='#{transcoder}'")
             @logger.error("moved jobs from offline transcoder #{transcoder}")
         end }
 end 
