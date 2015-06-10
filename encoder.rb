@@ -102,7 +102,6 @@ def start_encoder(encoder=nil)
         private_ip=instance[1]
         @logger.debug("#{instance_id} -> #{private_ip}")
         encoder="enc#{instance_id.gsub("i-", "")}"
-        create_set=[ { :action => :create, :name => "#{encoder}.jwplatform.com", :type => "A", :ttl => 30, :resource_records => private_ip } ]
         r53 = Aws::Route53::Client.new(region: "us-east-1", credentials: @awsdev)
         resp = r53.change_resource_record_sets( hosted_zone_id: "Z21GK6IRST1JD7",
                change_batch: { comment: "changed by autoscaler",
@@ -152,8 +151,7 @@ def check_queue
     online = @db.query("select count(*) from transcoder where slot_type='large'").first.values[0]
     queue = @db.query("select count(*) from queue where type='conversion' and subpriority < 25 and transcoder_id is null and added < now()-60").first.values[0]
     users = @db.query("SELECT COUNT(DISTINCT `scheduler_group_id`) FROM `queue` WHERE `try_count` < max_try_count;").first.values[0]
-    #@db.query("update queue set priority=6 where data not like '%320L%' and subpriority > 25") #prioritize 320L to keep queue at minimum and speed up ready state until proper fix is in place
-    #sweeper()
+    @db.query("update queue set priority=6 where data not like '%320L%' and subpriority > 25") #prioritize 320L to keep queue at minimum and speed up ready state until proper fix is in place
     @logger.debug("queue at #{queue}, users at #{users}")
     if queue > 15 or queuesize > online * 500
         scaleUp()
