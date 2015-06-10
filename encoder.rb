@@ -34,26 +34,11 @@ end
 def launchInstance(zone, subnet)
     response = @ec2.run_instances(
       image_id: @ami, min_count: 1, max_count: 1, key_name: "Ops-Prod", instance_type: "c4.4xlarge",
-      placement: {
-        availability_zone: zone,
-        tenancy: "default",
-      },
-      block_device_mappings: [
-        {
-          device_name: "/dev/sda1",
-          ebs: {
-            volume_size: 250,
-            delete_on_termination: true,
-            volume_type: "gp2",
-          },
-        },
-      ],
-      monitoring: { enabled: true },
-      disable_api_termination: false,
-      instance_initiated_shutdown_behavior: "terminate",
+      placement: { availability_zone: zone, tenancy: "default" },
+      block_device_mappings: [ { device_name: "/dev/sda1", ebs: { volume_size: 250, delete_on_termination: true, volume_type: "gp2", }, }, ],
+      monitoring: { enabled: true }, disable_api_termination: false, instance_initiated_shutdown_behavior: "terminate",
       network_interfaces: [ { groups: [@default_security_group], subnet_id: subnet, device_index: 0, associate_public_ip_address: true } ],
-      iam_instance_profile: { name: "Encoder" },
-      ebs_optimized: true,
+      iam_instance_profile: { name: "Encoder" }, ebs_optimized: true,
     )
     return [response[:instances][0][0], response[:instances][0]["private_ip_address"]]
 end
@@ -69,20 +54,6 @@ def monitor(remove=false)
                     `/usr/bin/cmk -II #{enc.keys[0]}.jwplatform.com` } unless remove==true
     @logger.debug(`/usr/bin/cmk -O`)
 end
-
-def sweeper()
-    registeredTranscoders = []
-    @db.query("select distinct(transcoder_id) from transcoder").each {|result| registeredTranscoders <<  result.values[0] unless result.values[0] == "enc0"}
-    registeredTranscoders.each {|transcoder|
-        running = @ec2.describe_instance_status(:instance_ids => [transcoder.gsub("enc", "i-")]).data.inspect.match(/running/).to_s rescue Aws::EC2::Errors::InvalidInstanceIDNotFound
-        if running != "running"
-            @db.query("delete from transcoder where transcoder_id='#{transcoder}'")
-            @logger.error("deleted offline transcoder #{transcoder} from pool")
-            @db.query("update queue set processed = null, transcoder_id=null where transcoder_id='#{transcoder}'")
-            @db.query("update uploadqueue set upload_server_id='enc0', processing = NULL where upload_server_id='#{transcoder}'")
-            @logger.error("moved jobs from offline transcoder #{transcoder}")
-        end }
-end 
 
 def stop_encoder(encoder) 
     success=false
@@ -101,7 +72,9 @@ def stop_encoder(encoder)
         end
     else
         if !(@ec2.describe_instance_status(:instance_ids => encoder.values).data.inspect.match(/running/) )
-            @logger.error("#{encoder.keys.first} is down but jobs are queued")
+            @logger.error("#{encoder.keys.first} is down but jobs are queued, moving jobs")
+            @db.query("update queue set processed = null, transcoder_id=null where transcoder_id='#{transcoder}'")
+            @db.query("update uploadqueue set upload_server_id='enc0', processing = NULL where upload_server_id='#{transcoder}'")
         else
             @logger.info("job stuck on #{encoder.keys.first}, skipping")
         end
