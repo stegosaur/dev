@@ -16,7 +16,7 @@ def getInstances()
     @oldEncoders = @encoders unless @encoders.nil?
     @encoders = []
     @instances.each{ |instance| 
-        if instance[:instances][0][:tags].inspect =~ /"Name", value="enc.*jwplatform.com/ and !(instance.inspect.match("enc0.jwplatform.com"))
+        if instance[:instances][0][:tags].inspect =~ /"Name", value="enc.*jwplatform.com/ and !(instance.inspect.match("enc0.jwplatform.com")) and instance.inspect.match(/running/)
             @encoders << { "#{instance.inspect.match(/value="enc.*?jwplatform.com/).to_s.gsub(/.jwplatform.com|value="/, "")}" => "#{instance[4][0][0]}"} 
             @zone[instance[4][0][11][0]] += 1
         end
@@ -32,7 +32,7 @@ def getInstances()
 end
 
 def launchInstance(zone, subnet)
-    instance_id = @ec2.run_instances(
+    response = @ec2.run_instances(
       image_id: @ami, min_count: 1, max_count: 1, key_name: "Ops-Prod", instance_type: "c4.4xlarge",
       placement: {
         availability_zone: zone,
@@ -54,8 +54,8 @@ def launchInstance(zone, subnet)
       network_interfaces: [ { groups: [@default_security_group], subnet_id: subnet, device_index: 0, associate_public_ip_address: true } ],
       iam_instance_profile: { name: "Encoder" },
       ebs_optimized: true,
-    )[:instances][0][0]
-    return instance_id
+    )
+    return [response[:instances][0][0], response[:instances][0]["private_ip_address"]]
 end
 
 def monitor(remove=false)
@@ -89,34 +89,33 @@ def stop_encoder(encoder)
     timeStarted=@ec2.describe_instances(:instance_ids => encoder.values)[:reservations][0][:instances][0][10]
     if @db.query("select (select count(*) from uploadqueue where upload_server_id='#{encoder.keys.first}') + (select count(*) from queue where transcoder_id='#{encoder.keys.first}') as total").first.values[0] == 0
         if @ec2.describe_instance_status(:instance_ids => encoder.values).data.inspect.match(/running/) 
-            if  (timeStarted.min-15...timeStarted.min).cover?(Time.now.min) || (timeStarted.min-15+60..timeStarted.min+60).cover?(Time.now.min) 
+            if (timeStarted.min-15...timeStarted.min).cover?(Time.now.min) || (timeStarted.min-15+60..timeStarted.min+60).cover?(Time.now.min) 
                 @db.query("delete from transcoder where transcoder_id='#{encoder.keys.first}'")
                 @db.query("delete from uploader where uploader_id='#{encoder.keys.first}'")
                 @logger.info("stopping #{encoder.keys.first}")
                 @ec2.terminate_instances(:instance_ids => encoder.values)
                 success = true
-                monitor(encoder, false)
             else
                 @logger.info("allowing #{encoder.keys.first} to stay online until time expired")
             end
         end
     else
-        in_service=@db.query("select in_service from transcoder where transcoder_id='#{encoder.keys.first}'").first
         if !(@ec2.describe_instance_status(:instance_ids => encoder.values).data.inspect.match(/running/) )
             @logger.error("#{encoder.keys.first} is down but jobs are queued")
         else
             @logger.info("job stuck on #{encoder.keys.first}, skipping")
-            if (timeStarted.min-20...timeStarted.min).cover?(Time.now.min) || (timeStarted.min-20+60..timeStarted.min+60).cover?(Time.now.min)
-                @db.query("update transcoder set in_service=0 where transcoder_id='#{encoder.keys.first}'")
-                @db.query("update uploader set in_service=0 where uploader_id='#{encoder.keys.first}'")
-                @logger.info("taking #{encoder.keys.first} out of service to cool down") if @db.affected_rows > 0 
-            else 
-                @db.query("update transcoder set in_service=1 where transcoder_id='#{encoder.keys.first}'")
-                @db.query("update uploader set in_service=1 where uploader_id='#{encoder.keys.first}'")
-                @logger.info("putting #{encoder.keys.first} back in service") if @db.affected_rows > 0
-            end unless in_service.nil? 
         end
-    end 
+    end
+    in_service=@db.query("select in_service from transcoder where transcoder_id='#{encoder.keys.first}'").first
+    if (timeStarted.min-20...timeStarted.min).cover?(Time.now.min) || (timeStarted.min-20+60..timeStarted.min+60).cover?(Time.now.min)
+        @db.query("update uploader set in_service=0 where uploader_id='#{encoder.keys.first}'")
+        @db.query("update transcoder set in_service=0 where transcoder_id='#{encoder.keys.first}'")
+        @logger.info("taking #{encoder.keys.first} out of service to cool down") if @db.affected_rows > 0 
+    else 
+        @db.query("update uploader set in_service=1 where uploader_id='#{encoder.keys.first}'")
+        @db.query("update transcoder set in_service=1 where transcoder_id='#{encoder.keys.first}'")
+        @logger.info("putting #{encoder.keys.first} back in service") if @db.affected_rows > 0
+    end unless in_service.nil? 
     return success
 end
 
@@ -125,8 +124,16 @@ def start_encoder(encoder=nil)
     if encoder.nil?
         @logger.info("launching new encoder")
         zone = @zone.select {|key, value| value == @zone.values.min }.first[0]
-        instance_id=launchInstance(zone, @subnets[zone[-1]])
+        instance=launchInstance(zone, @subnets[zone[-1]])
+        instance_id=instance[0]
+        private_ip=instance[1]
+        @logger.debug("#{instance_id} -> #{private_ip}")
         encoder="enc#{instance_id.gsub("i-", "")}"
+        create_set=[ { :action => :create, :name => "#{encoder}.jwplatform.com", :type => "A", :ttl => 30, :resource_records => private_ip } ]
+        r53 = Aws::Route53::Client.new(region: "us-east-1", credentials: @awsdev)
+        resp = r53.change_resource_record_sets( hosted_zone_id: "Z21GK6IRST1JD7",
+               change_batch: { comment: "changed by autoscaler",
+               changes: [ { action: "CREATE", resource_record_set: { name: "#{encoder}.jwplatform.com", type: "A", set_identifier: "ResourceRecordSetIdentifier", region: "us-east-1", ttl: 30, resource_records: [ { value: private_ip } ], }, }, ], } )
         count=0
         until @db.query("select count(*) from transcoder where transcoder_id='#{encoder}'").first.values[0] != 0
             count += 1
@@ -135,7 +142,6 @@ def start_encoder(encoder=nil)
             break if count == 300 
         end
         success = true unless @db.query("select count(*) from transcoder where transcoder_id='#{encoder}'").first.values[0] == 0
-        #monitor(encoder, true) unless success == false
     else
         @logger.info("reactivating encoder #{encoder}") unless encoder.size == 0
         @db.query("update transcoder set in_service=1 where transcoder_id='#{encoder}'")
