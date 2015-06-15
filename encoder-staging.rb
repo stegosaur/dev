@@ -6,41 +6,55 @@ require 'mysql2'
 require 'logger'
 require 'config-stage.rb'
 
+@logger = Logger.new(@config["logpath"])
+@db = Mysql2::Client.new(:host => @config["db_host"], :username => @config["db_user"], :password => @config["db_pass"], :database => 'transcoding')
+@awsprod = Aws::Credentials.new(@config["aws_prod_key"], @config["aws_prod_secret"])
+@awsdev = Aws::Credentials.new(@config["aws_dev_key"], @config["aws_dev_secret"])
+@subnets = @config["subnets"]
+@environment_filters = "-#{@config["environment"]}" unless @config["environment"] == "production"
+@environment_filters = "" if @config["environment"] == "production"
+
+Aws.config.update({region: 'us-east-1', credentials: @awsprod })
 @ec2 = Aws::EC2::Client.new(region: 'us-east-1')
 
 
 def getInstances()
-     @zone = @zones
+     @zone = @config["zones"]
      @instances = @ec2.describe_instances(max_results: 1000)[0]
      @oldEncoders = [] if @encoders.nil?
      @oldEncoders = @encoders unless @encoders.nil?
      @encoders = []
      @instances.each{ |instance| 
-         if instance[:instances][0][:tags].inspect =~ /"Name", value="enc.*-staging.jwplatform.com/ and !(instance.inspect.match("enc0-staging.jwplatform.com")) and instance.inspect.match(/running/)
-             @encoders << { "#{instance.inspect.match(/value="enc.*?-staging.jwplatform.com/).to_s.gsub(/.jwplatform.com|value="/, "")}" => "#{instance[4][0][0]}"}
+         if instance[:instances][0][:tags].inspect =~ /"Name", value="enc.*?#{@environment_filters}.jwplatform.com/ and !(instance.inspect.match(@config["base_transcoder_name"])) and instance.inspect.match(/running/)
+             @encoders << { "#{instance.inspect.match(/value="enc.*?#{filters}.jwplatform.com/).to_s.gsub(/.jwplatform.com|value="/, "")}" => "#{instance[4][0][0]}"}
              @zone[instance[4][0][11][0]] += 1
          end    
      }          
      @encoders=@encoders.sort_by { |key| key.keys }
      if @encoders-@oldEncoders != []
          @logger.debug("new transcoders detected: #{(@encoders - @oldEncoders).to_s}")
-         monitor() 
+         monitor() if @config["environment"] == "production" 
      elsif @oldEncoders-@encoders != []
      @logger.debug("transcoder removal detected: #{(@oldEncoders - @encoders).to_s}")
-         monitor(true)
+         monitor(true) if @config["environment"] == "production"
      end 
 end     
 
 def launchInstance(zone, subnet)
-     response = @ec2.run_instances(
-       image_id: @ami, min_count: 1, max_count: 1, key_name: "Ops-Stage", instance_type: "c4.xlarge",
-       placement: { availability_zone: zone, tenancy: "default" },
-       block_device_mappings: [ { device_name: "/dev/sda1", ebs: { volume_size: 10, delete_on_termination: true, volume_type: "standard", }, }, ],
-       monitoring: { enabled: true }, disable_api_termination: false, instance_initiated_shutdown_behavior: "terminate",
-       network_interfaces: [ { groups: [@default_security_group], subnet_id: subnet, device_index: 0, associate_public_ip_address: true } ],
-       iam_instance_profile: { name: "Encoder" }, ebs_optimized: true,
-     )
-     return [response[:instances][0][0], response[:instances][0]["private_ip_address"]]
+    begin
+    response = @ec2.run_instances(
+        image_id: @config["ami"], min_count: 1, max_count: 1, key_name: @config["ec2_key_name"], instance_type: @config["ec2_instance_type"],
+        placement: { availability_zone: zone, tenancy: "default" },
+        block_device_mappings: [ { device_name: "/dev/sda1", ebs: { volume_size: @config["ebs_volume_size"], delete_on_termination: true, volume_type: @config["ebs_volume_type"], }, }, ],
+        monitoring: { enabled: true }, disable_api_termination: false, instance_initiated_shutdown_behavior: "terminate",
+        network_interfaces: [ { groups: [@config["default_security_group"]], subnet_id: subnet, device_index: 0, associate_public_ip_address: true } ],
+        iam_instance_profile: { name: "Encoder" }, ebs_optimized: true )
+    rescue
+        @logger.error("instance failed to start, check AWS config. dying")
+        raise "instance failed to start"
+        exit 1
+    end
+    return [response[:instances][0][0], response[:instances][0]["private_ip_address"]]
 end    
 
 def monitor(remove=false)
@@ -50,9 +64,9 @@ def monitor(remove=false)
      conf.each { |line| f.write(line.gsub(/$/, "\n")) }
      f.chmod(0644)
      f.close
-#     @encoders.each {|enc| @logger.debug("scanning #{enc.keys[0]}")
-#                     `/usr/bin/cmk -II #{enc.keys[0]}.jwplatform.com` } unless remove==true
-#     @logger.debug(`/usr/bin/cmk -O`)
+     @encoders.each {|enc| @logger.debug("scanning #{enc.keys[0]}")
+                     `/usr/bin/cmk -II #{enc.keys[0]}.jwplatform.com` } unless remove==true
+     @logger.debug(`/usr/bin/cmk -O`)
 end
 
 def stop_encoder(encoder)
@@ -101,7 +115,7 @@ def start_encoder(encoder=nil)
          instance_id=instance[0]
          private_ip=instance[1]
          @logger.debug("#{instance_id} -> #{private_ip}")
-         encoder="enc#{instance_id.gsub("i-", "")}-staging"
+         encoder="enc#{instance_id.gsub("i-", "")}#{@environment_filters}"
          r53 = Aws::Route53::Client.new(region: "us-east-1", credentials: @awsdev)
          resp = r53.change_resource_record_sets( hosted_zone_id: "Z21GK6IRST1JD7",
                 change_batch: { comment: "changed by autoscaler",
@@ -153,9 +167,9 @@ def check_queue
      users = @db.query("SELECT COUNT(DISTINCT `scheduler_group_id`) FROM `queue` WHERE `try_count` < max_try_count;").first.values[0]
      @db.query("update queue set priority=6 where data not like '%320L%' and subpriority > 25") #prioritize 320L to keep queue at minimum and speed up ready state until proper fix is in place
      @logger.debug("queue at #{queue}, users at #{users}")
-     if queue > 15 or queuesize > online * 500
+     if queue > @config["max_unassigned_priority_jobs"] or queuesize > online * @config["max_unassigned_jobs"]
          scaleUp()
-     elsif queuesize > online*200 or queue >= 5
+     elsif queuesize > online*@config["activation_threshold"] or queue >= @config["priority_activation_threshold"]
          activateOnly=true
          scaleUp(activateOnly)
      else
