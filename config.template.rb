@@ -4,7 +4,7 @@
         "db_user" => "dbuser", #db username with sufficient permissions
         "db_pass" => "dbpassword", #db password
         "aws_key" => "AKIAXXXXXXXXXXXXXXXX", #aws key with launch and terminate permissions
-        "aws_secret" -> "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS", #aws secret for above
+        "aws_secret" => "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS", #aws secret for above
         "aws_r53_key" => "AKIAXXXXXXXXXXXXXXXX", #aws key for modifying dns
         "aws_r53_secret" => "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS", #aws secret for above   
         "subnets" => { "a" => "subnet-XXXXXXXX", "b" => "subnet-XXXXXXXX", "c" => "subnet-XXXXXXXX", "e" => "subnet-XXXXXXXX" }, #subnet ids to launch in to 
