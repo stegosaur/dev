@@ -4,18 +4,17 @@ $LOAD_PATH.unshift("#{File.dirname(__FILE__)}/")
 require 'aws-sdk'
 require 'mysql2'
 require 'logger'
-require 'config-stage.rb'
+require 'config.stage'
 
 @logger = Logger.new(@config["logpath"])
 @db = Mysql2::Client.new(:host => @config["db_host"], :username => @config["db_user"], :password => @config["db_pass"], :database => 'transcoding')
-@awsprod = Aws::Credentials.new(@config["aws_prod_key"], @config["aws_prod_secret"])
-@awsdev = Aws::Credentials.new(@config["aws_dev_key"], @config["aws_dev_secret"])
+@aws = Aws::Credentials.new(@config["aws_key"], @config["aws_secret"])
+@awsdev = Aws::Credentials.new(@config["aws_r53_key"], @config["aws_r53_secret"])
 @subnets = @config["subnets"]
 @environment_filters = "-#{@config["environment"]}" unless @config["environment"] == "production"
 @environment_filters = "" if @config["environment"] == "production"
 
-Aws.config.update({region: 'us-east-1', credentials: @awsprod })
-@ec2 = Aws::EC2::Client.new(region: 'us-east-1')
+@ec2 = Aws::EC2::Client.new(region: 'us-east-1', credentials: @aws)
 
 
 def getInstances()
@@ -26,7 +25,7 @@ def getInstances()
      @encoders = []
      @instances.each{ |instance| 
          if instance[:instances][0][:tags].inspect =~ /"Name", value="enc.*?#{@environment_filters}.jwplatform.com/ and !(instance.inspect.match(@config["base_transcoder_name"])) and instance.inspect.match(/running/)
-             @encoders << { "#{instance.inspect.match(/value="enc.*?#{filters}.jwplatform.com/).to_s.gsub(/.jwplatform.com|value="/, "")}" => "#{instance[4][0][0]}"}
+             @encoders << { "#{instance.inspect.match(/value="enc.*?#{@environment_filters}.jwplatform.com/).to_s.gsub(/.jwplatform.com|value="/, "")}" => "#{instance[4][0][0]}"}
              @zone[instance[4][0][11][0]] += 1
          end    
      }          
@@ -48,11 +47,10 @@ def launchInstance(zone, subnet)
         block_device_mappings: [ { device_name: "/dev/sda1", ebs: { volume_size: @config["ebs_volume_size"], delete_on_termination: true, volume_type: @config["ebs_volume_type"], }, }, ],
         monitoring: { enabled: true }, disable_api_termination: false, instance_initiated_shutdown_behavior: "terminate",
         network_interfaces: [ { groups: [@config["default_security_group"]], subnet_id: subnet, device_index: 0, associate_public_ip_address: true } ],
-        iam_instance_profile: { name: "Encoder" }, ebs_optimized: true )
+        iam_instance_profile: { name: @config["iam_role"] }, ebs_optimized: true )
     rescue
         @logger.error("instance failed to start, check AWS config. dying")
-        raise "instance failed to start"
-        exit 1
+        abort("dying") 
     end
     return [response[:instances][0][0], response[:instances][0]["private_ip_address"]]
 end    
@@ -116,10 +114,15 @@ def start_encoder(encoder=nil)
          private_ip=instance[1]
          @logger.debug("#{instance_id} -> #{private_ip}")
          encoder="enc#{instance_id.gsub("i-", "")}#{@environment_filters}"
-         r53 = Aws::Route53::Client.new(region: "us-east-1", credentials: @awsdev)
-         resp = r53.change_resource_record_sets( hosted_zone_id: "Z21GK6IRST1JD7",
-                change_batch: { comment: "changed by autoscaler",
-                changes: [ { action: "CREATE", resource_record_set: { name: "#{encoder}.jwplatform.com", type: "A", set_identifier: "ResourceRecordSetIdentifier", region: "us-east-1", ttl: 30, resource_records: [ { value: private_ip } ],  }, }, ], } )
+         begin
+             r53 = Aws::Route53::Client.new(region: "us-east-1", credentials: @awsdev)
+             resp = r53.change_resource_record_sets( hosted_zone_id: "Z21GK6IRST1JD7",
+                    change_batch: { comment: "changed by autoscaler",
+                    changes: [ { action: "CREATE", resource_record_set: { name: "#{encoder}.jwplatform.com", type: "A", set_identifier: "ResourceRecordSetIdentifier", region: "us-east-1", ttl: 30, resource_records: [ { value: private_ip } ],  }, }, ], } )
+         rescue
+             @logger.error("unable to update dns. dying")
+             abort("aws error")
+         end
          count=0
          until @db.query("select count(*) from transcoder where transcoder_id='#{encoder}'").first.values[0] != 0
              count += 1
