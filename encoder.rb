@@ -58,7 +58,7 @@ end
 def monitor(remove=false)
      conf=["all_hosts += [", "", "]"]
      @encoders.each {|enc| conf.insert(1, "'#{enc.keys[0]}.jwplatform.com',") }
-     f = File.new("/tmp/enc.mk", "w+")
+     f = File.new("/etc/check_mk/conf.d/enc.mk", "w+")
      conf.each { |line| f.write(line.gsub(/$/, "\n")) }
      f.chmod(0644)
      f.close
