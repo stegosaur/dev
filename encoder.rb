@@ -168,7 +168,7 @@ def check_queue
      online = @db.query("select count(*) from transcoder where slot_type='large'").first.values[0]
      queue = @db.query("select count(*) from queue where type='conversion' and subpriority < 25 and transcoder_id is null and added < now()-60").first.values[0]
      users = @db.query("SELECT COUNT(DISTINCT `scheduler_group_id`) FROM `queue` WHERE `try_count` < max_try_count;").first.values[0]
-     @db.query("update queue set priority=6 where data not like '%320L%' and subpriority > 25") #prioritize 320L to keep queue at minimum and speed up ready state until proper fix is in place
+     #@db.query("update queue set priority=6 where data not like '%320L%' and subpriority > 25") #prioritize 320L to keep queue at minimum and speed up ready state until proper fix is in place
      @logger.debug("queue at #{queue}, users at #{users}")
      if queue > @config["max_unassigned_priority_jobs"] or queuesize > online * @config["max_unassigned_jobs"]
          scaleUp()
