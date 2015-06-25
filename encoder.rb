@@ -25,13 +25,16 @@ def getInstances()
      @encoders = []
      @instances.each{ |instance| 
          if instance[:instances][0][:tags].inspect =~ /"Name", value="enc.*?#{@environment_filters}.jwplatform.com/ and !(instance.inspect.match(@config["base_transcoder_name"])) and instance.inspect.match(/running/)
-             @encoders << { "#{instance.inspect.match(/value="enc.*?#{@environment_filters}.jwplatform.com/).to_s.gsub(/.jwplatform.com|value="/, "")}" => "#{instance[4][0][0]}"}
+             @encoders << { "#{instance.inspect.match(/"Name", value="enc.*?#{@environment_filters}.jwplatform.com/).to_s.gsub(/.jwplatform.com|"Name", value="/, "")}" => "#{instance[4][0][0]}"}
              @zone[instance[4][0][11][0]] += 1
          end    
      }          
      @encoders=@encoders.sort_by { |key| key.keys }
      if @encoders-@oldEncoders != []
          @logger.debug("new transcoders detected: #{(@encoders - @oldEncoders).to_s}")
+         (@encoders-@oldEncoders).each { |newEncoder| newEncoder = newEncoder.keys.first 
+                @instances.each { |instance|
+                        updateDNS(newEncoder, instance[:instances][0][:private_ip_address]) if instance[:instances][0][:tags].inspect.match(/#{newEncoder}/) } } 
          monitor() if @config["environment"] == "production" 
      elsif @oldEncoders-@encoders != []
      @logger.debug("transcoder removal detected: #{(@oldEncoders - @encoders).to_s}")
@@ -48,17 +51,31 @@ def launchInstance(zone, subnet)
         monitoring: { enabled: true }, disable_api_termination: false, instance_initiated_shutdown_behavior: "terminate",
         network_interfaces: [ { groups: [@config["default_security_group"]], subnet_id: subnet, device_index: 0, associate_public_ip_address: true } ],
         iam_instance_profile: { name: @config["iam_role"] }, ebs_optimized: true )
-    rescue
-        @logger.error("instance failed to start, check AWS config. dying")
-        abort("dying") 
+    rescue Exception => e
+        @logger.error("instance failed to start (#{e}), check AWS config. dying")
+        abort("aws error") 
     end
     return [response[:instances][0][0], response[:instances][0]["private_ip_address"]]
 end    
 
+def updateDNS(name, record)
+    r53 = Aws::Route53::Client.new(region: "us-east-1", credentials: @awsdev)
+    r53.list_hosted_zones rescue abort("aws error") #die if r53 can't do this for whatever reason
+    resp = r53.change_resource_record_sets( hosted_zone_id: "Z21GK6IRST1JD7",
+        change_batch: { comment: "changed by autoscaler",
+        changes: [ { action: "CREATE", resource_record_set: { name: name + ".jwplatform.com" , type: "A", set_identifier: "ResourceRecordSetIdentifier", region: "us-east-1", ttl: 30, resource_records: [ { value: record } ],  }, }, ], } ) rescue update=false
+    if update == false
+        return true
+    else
+        @logger.info("updating dns #{name} => #{record}")
+        sleep 5
+    end
+end
+
 def monitor(remove=false)
      conf=["all_hosts += [", "", "]"]
      @encoders.each {|enc| conf.insert(1, "'#{enc.keys[0]}.jwplatform.com',") }
-     f = File.new("/etc/check_mk/conf.d/enc.mk", "w+")
+     f = File.new("/tmp/enc.mk", "w+")
      conf.each { |line| f.write(line.gsub(/$/, "\n")) }
      f.chmod(0644)
      f.close
@@ -112,17 +129,8 @@ def start_encoder(encoder=nil)
          instance=launchInstance(zone, @subnets[zone[-1]])
          instance_id=instance[0]
          private_ip=instance[1]
-         @logger.debug("#{instance_id} -> #{private_ip}")
          encoder="enc#{instance_id.gsub("i-", "")}#{@environment_filters}"
-         begin
-             r53 = Aws::Route53::Client.new(region: "us-east-1", credentials: @awsdev)
-             resp = r53.change_resource_record_sets( hosted_zone_id: "Z21GK6IRST1JD7",
-                    change_batch: { comment: "changed by autoscaler",
-                    changes: [ { action: "CREATE", resource_record_set: { name: "#{encoder}.jwplatform.com", type: "A", set_identifier: "ResourceRecordSetIdentifier", region: "us-east-1", ttl: 30, resource_records: [ { value: private_ip } ],  }, }, ], } )
-         rescue
-             @logger.error("unable to update dns. dying")
-             abort("aws error")
-         end
+         updateDNS(encoder, private_ip)
          count=0
          until @db.query("select count(*) from transcoder where transcoder_id='#{encoder}'").first.values[0] != 0
              count += 1
@@ -185,8 +193,9 @@ while true
         check_queue()
         sleep 30 
     rescue Exception => e
-        @logger.debug(e)
-        exit if e =~ /Mysql2::Error/
+        e = e.to_s
+        exit 1 if e =~ /Mysql2::Error/
+        exit 1 if e =~ /aws error/
         sleep 5
     end
 end
