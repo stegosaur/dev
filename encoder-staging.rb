@@ -7,6 +7,7 @@ require 'logger'
 require 'config.stage'
 
 @logger = Logger.new(@config["logpath"])
+@logger.level = Logger::DEBUG
 @db = Mysql2::Client.new(:host => @config["db_host"], :username => @config["db_user"], :password => @config["db_pass"], :database => 'transcoding')
 @aws = Aws::Credentials.new(@config["aws_key"], @config["aws_secret"])
 @awsdev = Aws::Credentials.new(@config["aws_r53_key"], @config["aws_r53_secret"])
@@ -31,7 +32,7 @@ def getInstances()
      }          
      @encoders=@encoders.sort_by { |key| key.keys }
      if @encoders-@oldEncoders != []
-         @logger.debug("new transcoders detected: #{(@encoders - @oldEncoders).to_s}")
+         @logger.info("new transcoders detected: #{(@encoders - @oldEncoders).to_s}")
          (@encoders-@oldEncoders).each { |newEncoder| newEncoder = newEncoder.keys.first 
                 @instances.each { |instance|
                         updateDNS(newEncoder, instance[:instances][0][:private_ip_address]) if instance[:instances][0][:tags].inspect.match(/#{newEncoder}/) } } 
@@ -174,9 +175,9 @@ def check_queue
      getInstances()
      queuesize =  @db.query("select count(*) from queue").first.values[0]
      online = @db.query("select count(*) from transcoder where slot_type='large'").first.values[0]
-     queue = @db.query("select count(*) from queue where type='conversion' and subpriority < 25 and transcoder_id is null and added < now()-60").first.values[0]
+     jobAge = 60 * (online.to_i*0.2 + 1.0) - 12
+     queue = @db.query("select count(*) from queue where type='conversion' and subpriority < 25 and transcoder_id is null and added < now()-#{jobAge}").first.values[0]
      users = @db.query("SELECT COUNT(DISTINCT `scheduler_group_id`) FROM `queue` WHERE `try_count` < max_try_count;").first.values[0]
-     #@db.query("update queue set priority=6 where data not like '%320L%' and subpriority > 25") #prioritize 320L to keep queue at minimum and speed up ready state until proper fix is in place
      @logger.debug("queue at #{queue}, users at #{users}")
      if queue > @config["max_unassigned_priority_jobs"] or queuesize > online * @config["max_unassigned_jobs"]
          scaleUp()
@@ -196,6 +197,7 @@ while true
         e = e.to_s
         exit 1 if e =~ /Mysql2::Error/
         exit 1 if e =~ /aws error/
+        @logger.debug(e)
         sleep 5
     end
 end
