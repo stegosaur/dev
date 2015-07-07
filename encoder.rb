@@ -52,8 +52,8 @@ def launchInstance(zone, subnet)
         network_interfaces: [ { groups: [@config["default_security_group"]], subnet_id: subnet, device_index: 0, associate_public_ip_address: true } ],
         iam_instance_profile: { name: @config["iam_role"] }, ebs_optimized: true )
     rescue Exception => e
-        @logger.error("instance failed to start (#{e}), check AWS config. dying")
-        abort("aws error") 
+        @logger.error("instance failed to start (#{e}), check AWS config.")
+        abort("aws error") unless e.inspect.match(/capacity/)
     end
     return [response[:instances][0][0], response[:instances][0]["private_ip_address"]]
 end    
@@ -68,14 +68,14 @@ def updateDNS(name, record)
         return true
     else
         @logger.info("updating dns #{name} => #{record}")
-        sleep 5
+        sleep 15
     end
 end
 
 def monitor(remove=false)
      conf=["all_hosts += [", "", "]"]
      @encoders.each {|enc| conf.insert(1, "'#{enc.keys[0]}.jwplatform.com',") }
-     f = File.new("/tmp/enc.mk", "w+")
+     f = File.new("/etc/check_mk/conf.d/enc.mk", "w+")
      conf.each { |line| f.write(line.gsub(/$/, "\n")) }
      f.chmod(0644)
      f.close
@@ -174,9 +174,9 @@ def check_queue
      getInstances()
      queuesize =  @db.query("select count(*) from queue").first.values[0]
      online = @db.query("select count(*) from transcoder where slot_type='large'").first.values[0]
-     queue = @db.query("select count(*) from queue where type='conversion' and subpriority < 25 and transcoder_id is null and added < now()-60").first.values[0]
+     jobAge = 60 * (online.to_i*0.2 + 1.0) - 12
+     queue = @db.query("select count(*) from queue where type='conversion' and subpriority < 25 and transcoder_id is null and added < now()-#{jobAge}").first.values[0]
      users = @db.query("SELECT COUNT(DISTINCT `scheduler_group_id`) FROM `queue` WHERE `try_count` < max_try_count;").first.values[0]
-     #@db.query("update queue set priority=6 where data not like '%320L%' and subpriority > 25") #prioritize 320L to keep queue at minimum and speed up ready state until proper fix is in place
      @logger.debug("queue at #{queue}, users at #{users}")
      if queue > @config["max_unassigned_priority_jobs"] or queuesize > online * @config["max_unassigned_jobs"]
          scaleUp()
