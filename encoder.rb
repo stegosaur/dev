@@ -142,6 +142,7 @@ def start_encoder(encoder=nil)
      else
          @logger.info("reactivating encoder #{encoder}") unless encoder.size == 0
          @db.query("update transcoder set in_service=1 where transcoder_id='#{encoder}'")
+         @db.query("update uploader set in_service=1 where transcoder_id='#{encoder}'")
          success = true
      end
      return success

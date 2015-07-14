@@ -125,25 +125,26 @@ end
 def start_encoder(encoder=nil)
      success = false
      if encoder.nil?
-         @logger.info("launching new encoder")
-         zone = @zone.select {|key, value| value == @zone.values.min }.first[0]
-         instance=launchInstance(zone, @subnets[zone[-1]])
-         instance_id=instance[0]
-         private_ip=instance[1]
-         encoder="enc#{instance_id.gsub("i-", "")}#{@environment_filters}"
-         updateDNS(encoder, private_ip)
-         count=0
-         until @db.query("select count(*) from transcoder where transcoder_id='#{encoder}'").first.values[0] != 0
-             count += 1
-             sleep 1
-             @logger.info("waiting for #{encoder} to start...") if count % 15 == 0
-             break if count == 300
-         end
-         success = true unless @db.query("select count(*) from transcoder where transcoder_id='#{encoder}'").first.values[0] == 0
+        @logger.info("launching new encoder")
+        zone = @zone.select {|key, value| value == @zone.values.min }.first[0]
+        instance=launchInstance(zone, @subnets[zone[-1]])
+        instance_id=instance[0]
+        private_ip=instance[1]
+        encoder="enc#{instance_id.gsub("i-", "")}#{@environment_filters}"
+        updateDNS(encoder, private_ip)
+        count=0
+        until @db.query("select count(*) from transcoder where transcoder_id='#{encoder}'").first.values[0] != 0
+            count += 1
+            sleep 1
+            @logger.info("waiting for #{encoder} to start...") if count % 15 == 0
+            break if count == 300
+        end
+        success = true unless @db.query("select count(*) from transcoder where transcoder_id='#{encoder}'").first.values[0] == 0
      else
-         @logger.info("reactivating encoder #{encoder}") unless encoder.size == 0
-         @db.query("update transcoder set in_service=1 where transcoder_id='#{encoder}'")
-         success = true
+        @logger.info("reactivating encoder #{encoder}") unless encoder.size == 0
+        @db.query("update transcoder set in_service=1 where transcoder_id='#{encoder}'")
+        @db.query("update uploader set in_service=1 where transcoder_id='#{encoder}'")
+        success = true
      end
      return success
 end
