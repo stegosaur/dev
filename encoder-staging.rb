@@ -43,20 +43,33 @@ def getInstances()
      end 
 end     
 
-def launchInstance(zone, subnet)
+def launchInstance(zone, subnet, spot=false)
     begin
-    response = @ec2.run_instances(
-        image_id: @config["ami"], min_count: 1, max_count: 1, key_name: @config["ec2_key_name"], instance_type: @config["ec2_instance_type"],
-        placement: { availability_zone: zone, tenancy: "default" },
+    launchSpec = {image_id: @config["ami"], min_count: 1, max_count: 1, key_name: @config["ec2_key_name"], instance_type: @config["ec2_instance_type"],
+        placement: { availability_zone: zone },
         block_device_mappings: [ { device_name: "/dev/sda1", ebs: { volume_size: @config["ebs_volume_size"], delete_on_termination: true, volume_type: @config["ebs_volume_type"], }, }, ],
         monitoring: { enabled: true }, disable_api_termination: false, instance_initiated_shutdown_behavior: "terminate",
         network_interfaces: [ { groups: [@config["default_security_group"]], subnet_id: subnet, device_index: 0, associate_public_ip_address: true } ],
-        iam_instance_profile: { name: @config["iam_role"] }, ebs_optimized: true )
+        iam_instance_profile: { name: @config["iam_role"] }, ebs_optimized: true}
+    if spot == true
+        launchSpec.delete(:min_count)
+        launchSpec.delete(:max_count)
+        launchSpec.delete(:disable_api_termination)
+        launchSpec.delete(:instance_initiated_shutdown_behavior)
+        launchSpec[:instance_type] = "cc2.8xlarge"
+        spotSpec = { spot_price: "90.00", instance_count: 1, type: "one-time", launch_specification: launchSpec }
+        @logger.info("requesting spot instance")
+        response = @ec2.request_spot_instances(spotSpec)
+        sleep 25
+    else
+        response = @ec2.run_instances(launchSpec)
+    end
     rescue Exception => e
         @logger.error("instance failed to start (#{e}), check AWS config. dying")
         abort("aws error") 
     end
-    return [response[:instances][0][0], response[:instances][0]["private_ip_address"]]
+    return [response[:instances][0][0], response[:instances][0]["private_ip_address"]] unless spot
+    return response[0][0][:spot_instance_request_id] if spot
 end    
 
 def updateDNS(name, record)
@@ -126,7 +139,7 @@ def start_encoder(encoder=nil)
      success = false
      if encoder.nil?
         @logger.info("launching new encoder")
-        zone = @zone.select {|key, value| value == @zone.values.min }.first[0]
+        zone = @zone.key(@zone.values.min)
         instance=launchInstance(zone, @subnets[zone[-1]])
         instance_id=instance[0]
         private_ip=instance[1]
@@ -143,13 +156,13 @@ def start_encoder(encoder=nil)
      else
         @logger.info("reactivating encoder #{encoder}") unless encoder.size == 0
         @db.query("update transcoder set in_service=1 where transcoder_id='#{encoder}'")
-        @db.query("update uploader set in_service=1 where transcoder_id='#{encoder}'")
+        @db.query("update uploader set in_service=1 where uploader_id='#{encoder}'")
         success = true
      end
      return success
 end
 
-def scaleUp(activateOnly=false)
+def scaleUp(activateOnly=false,spot=false)
     response = nil
     begin
        inactive = @db.query("select distinct(transcoder_id) from transcoder where in_service = 0").first.values[0]
@@ -158,8 +171,16 @@ def scaleUp(activateOnly=false)
     end
     if inactive.size > 0 or activateOnly == true
         response = start_encoder(inactive) 
-    elsif inactive.size == 0
+    elsif inactive.size == 0 and spot == false
         response = start_encoder()
+    elsif spot == true
+        prices = {} 
+        @ec2.describe_spot_price_history({instance_types: ["cc2.8xlarge"], product_descriptions: ["Linux/UNIX (Amazon VPC)"], start_time: Time.now})[0].each { |price| 
+                prices.merge!({ price[:availability_zone] => price[:spot_price].to_f }) }
+        zone = prices.key(prices.values.min)
+        subnet = @subnets[zone[-1]] 
+        response = launchInstance(zone, subnet, spot)
+        @logger.info("successfully requested spot with id #{response}")
     end
     return true if response or activateOnly
 end
@@ -176,17 +197,21 @@ def check_queue
      getInstances()
      queuesize =  @db.query("select count(*) from queue").first.values[0]
      online = @db.query("select count(*) from transcoder where slot_type='large'").first.values[0]
+     spots = @ec2.describe_spot_instance_requests({filters:[ {name: "state", values: ["active", "open"] }, {name: "launch.image-id", values:["ami-f5857e9e"] } ] } )[0].size
      jobAge = 60 * (online.to_i*0.2 + 1.0) - 12
      queue = @db.query("select count(*) from queue where type='conversion' and subpriority < 25 and transcoder_id is null and added < now()-#{jobAge}").first.values[0]
      users = @db.query("SELECT COUNT(DISTINCT `scheduler_group_id`) FROM `queue` WHERE `try_count` < max_try_count;").first.values[0]
-     @logger.debug("queue at #{queue}, users at #{users}")
-     if queue > @config["max_unassigned_priority_jobs"] or queuesize > online * @config["max_unassigned_jobs"]
+     @db.query("update queue set priority=4 where type='metadata'") #metadata should take priority over all other small jobs
+     @logger.debug("priority queue jobs: #{queue}, total queue size: #{queuesize}, users: #{users}, encoders online: #{online}, spot requests: #{spots}")
+     if queue > @config["max_unassigned_priority_jobs"]
          scaleUp()
      elsif queuesize > online*@config["activation_threshold"] or queue >= @config["priority_activation_threshold"]
-         activateOnly=true
-         scaleUp(activateOnly)
+         scaleUp(true, false)
      else
          scaleDown() unless queue > 0
+     end
+     if queuesize/@config["activation_threshold"] > spots
+        scaleUp(false, true)
      end
 end
 
@@ -195,9 +220,12 @@ while true
         check_queue()
         sleep 30 
     rescue Exception => e
-        e = e.to_s
-        exit 1 if e =~ /Mysql2::Error/
-        exit 1 if e =~ /aws error/
+        exception = e.to_s
+        backtrace = e.backtrace.to_s
+        @logger.debug(exception)
+        @logger.debug(backtrace)
+        exit 1 if exception =~ /Mysql2::Error/
+        exit 1 if exception =~ /aws error/
         @logger.debug(e)
         sleep 5
     end
