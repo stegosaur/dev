@@ -19,7 +19,7 @@ require 'config.prod'
 
 
 def getInstances()
-     @zone = @config["zones"]
+     @zone = @config["zones"].dup
      @instances = @ec2.describe_instances(max_results: 1000)[0]
      @oldEncoders = [] if @encoders.nil?
      @oldEncoders = @encoders unless @encoders.nil?
@@ -56,6 +56,7 @@ def launchInstance(zone, subnet, spot=false)
         launchSpec.delete(:max_count)
         launchSpec.delete(:disable_api_termination)
         launchSpec.delete(:instance_initiated_shutdown_behavior)
+        launchSpec.delete(:ebs_optimized)
         launchSpec[:instance_type] = "cc2.8xlarge"
         spotSpec = { spot_price: "90.00", instance_count: 1, type: "one-time", launch_specification: launchSpec }
         @logger.info("requesting spot instance")
@@ -89,12 +90,12 @@ end
 def monitor(remove=false)
      conf=["all_hosts += [", "", "]"]
      @encoders.each {|enc| conf.insert(1, "'#{enc.keys[0]}.jwplatform.com',") }
-     f = File.new("/tmp/enc.mk", "w+")
+     f = File.new("/etc/check_mk/conf.d/enc.mk", "w+")
      conf.each { |line| f.write(line.gsub(/$/, "\n")) }
      f.chmod(0644)
      f.close
      @encoders.each {|enc| @logger.debug("scanning #{enc.keys[0]}")
-                     `/usr/bin/cmk -II #{enc.keys[0]}.jwplatform.com` } unless remove==true
+                     `/usr/bin/cmk -I #{enc.keys[0]}.jwplatform.com` } unless remove==true
      @logger.debug(`/usr/bin/cmk -O`)
 end
 
@@ -117,9 +118,6 @@ def stop_encoder(encoder)
          if !(@ec2.describe_instance_status(:instance_ids => encoder.values).data.inspect.match(/running/) )
              @logger.error("#{encoder.keys.first} is down but jobs are queued, moving jobs")
              @db.query("update queue set processed = null, transcoder_id=null where transcoder_id='#{transcoder}'")
-             @db.query("update uploadqueue set upload_server_id='enc0', processing = NULL where upload_server_id='#{transcoder}'")
-         else
-             @logger.info("job stuck on #{encoder.keys.first}, skipping")
          end
      end
      in_service=@db.query("select in_service from transcoder where transcoder_id='#{encoder.keys.first}'").first
@@ -202,16 +200,17 @@ def check_queue
      queue = @db.query("select count(*) from queue where type='conversion' and subpriority < 25 and transcoder_id is null and added < now()-#{jobAge}").first.values[0]
      users = @db.query("SELECT COUNT(DISTINCT `scheduler_group_id`) FROM `queue` WHERE `try_count` < max_try_count;").first.values[0]
      @db.query("update queue set priority=4 where type='metadata'") #metadata should take priority over all other small jobs
+     @db.query("update queue set priority=6 where subpriority > 25 and added < now()-3600 and data not like '%320L%'") #
      @logger.debug("priority queue jobs: #{queue}, total queue size: #{queuesize}, users: #{users}, encoders online: #{online}, spot requests: #{spots}")
      if queue > @config["max_unassigned_priority_jobs"]
          scaleUp()
      elsif queuesize > online*@config["activation_threshold"] or queue >= @config["priority_activation_threshold"]
-         scaleUp(true, false)
+         scaleUp(activateOnly=true, spot=false)
      else
          scaleDown() unless queue > 0
      end
-     if queuesize/@config["activation_threshold"] > spots
-        scaleUp(false, true)
+     if queuesize/@config["spot_request_threshold"] > online # > spots --- use on demand until proper handling for spots is in place
+        scaleUp(activateOnly=false, spot=false)
      end
 end
 
