@@ -1,4 +1,4 @@
 # dev
 
-various code written for infrastucture management of the jw platform  
-this is not compatible with any other infrastructure
+various code written for various purposes  
+useful for educational purposes, not much else
