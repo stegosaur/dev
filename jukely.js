@@ -34,8 +34,6 @@ function parseJukely() {
 
 events = parseJukely();
 window.stop();
-for (var i=0; i < 10; i++) {
-    window.setInterval(function () {
-        window.location.reload(true);
-    }, 60000*(Math.floor((Math.random() * 20) + 10)) );
-}
+window.setInterval(function () {
+    window.location.reload(true);
+}, 60000*(Math.floor((Math.random() * 20) + 10)) );
