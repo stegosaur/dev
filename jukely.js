@@ -33,14 +33,9 @@ function parseJukely() {
 }
 
 events = parseJukely();
-//content.toString().CreateTextFile("/tmp/output.txt",true);
-//writeToFile(events, "/tmp/output.txt");
 window.stop();
 for (var i=0; i < 10; i++) {
     window.setInterval(function () {
         window.location.reload(true);
     }, 60000*(Math.floor((Math.random() * 20) + 10)) );
 }
-
-//window.location.reload(true);
-//document.write(events.toString());
