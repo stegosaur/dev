@@ -1,4 +1,5 @@
 #!/usr/bin/env ruby
+#this is a script that takes an rds snapshot from one DB cluster and replaces a DB cluster on another account using it.
 
 require 'aws-sdk'
 require 'resolv'
